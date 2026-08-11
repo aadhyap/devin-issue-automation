@@ -5,5 +5,8 @@ app = FastAPI()
 @app.post("/github-webhook")
 async def github_webhook(request: Request):
     payload = await request.json()
+
+    print("Received GitHub event")
     print(payload)
+
     return {"status": "received"}
