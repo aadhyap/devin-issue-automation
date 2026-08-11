@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, timezone
+
 import requests
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -11,6 +13,8 @@ DEVIN_API_KEY = os.environ["DEVIN_API_KEY"]
 DEVIN_ORG_ID = os.environ["DEVIN_ORG_ID"]
 
 DEVIN_BASE_URL = "https://api.devin.ai/v3"
+
+tasks = {}
 
 
 def create_devin_session(issue: dict, repository: dict):
@@ -54,8 +58,20 @@ Do not make unrelated changes.
             "Authorization": f"Bearer {DEVIN_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "prompt": prompt
+        json={"prompt": prompt},
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_devin_session(session_id: str):
+    response = requests.get(
+        f"{DEVIN_BASE_URL}/organizations/{DEVIN_ORG_ID}/sessions/{session_id}",
+        headers={
+            "Authorization": f"Bearer {DEVIN_API_KEY}",
         },
         timeout=30,
     )
@@ -74,38 +90,82 @@ async def github_webhook(request: Request):
     issue = payload.get("issue", {})
     repository = payload.get("repository", {})
 
-    print(f"GitHub event received: action={action}, label={label}")
-
-    # Only delegate issues when devin-ready is added.
     if action != "labeled" or label != "devin-ready":
-        print("Ignoring event")
         return {
             "status": "ignored",
             "action": action,
             "label": label,
         }
 
-    print(f"Starting Devin for issue #{issue.get('number')}")
-    print(f"Title: {issue.get('title')}")
+    issue_number = issue.get("number")
 
     try:
         session = create_devin_session(issue, repository)
 
-        print("Devin session created")
-        print("Session ID:", session.get("session_id"))
-        print("Session URL:", session.get("url"))
+        tasks[issue_number] = {
+            "issue_number": issue_number,
+            "issue_title": issue.get("title"),
+            "issue_url": issue.get("html_url"),
+            "repo": repository.get("full_name"),
+            "session_id": session.get("session_id"),
+            "session_url": session.get("url"),
+            "status": session.get("status"),
+            "pull_requests": session.get("pull_requests", []),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        print(f"Started Devin for issue #{issue_number}")
+        print(f"Session: {session.get('url')}")
 
         return {
             "status": "started",
-            "issue_number": issue.get("number"),
-            "session_id": session.get("session_id"),
-            "session_url": session.get("url"),
+            "task": tasks[issue_number],
         }
 
     except requests.RequestException as error:
-        print("Failed to create Devin session:", error)
+        tasks[issue_number] = {
+            "issue_number": issue_number,
+            "issue_title": issue.get("title"),
+            "status": "failed_to_start",
+            "error": str(error),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
 
         return {
             "status": "error",
             "message": str(error),
         }
+
+
+@app.get("/status")
+def status():
+    return {
+        "total_tasks": len(tasks),
+        "tasks": list(tasks.values()),
+    }
+
+
+@app.get("/status/{issue_number}")
+def issue_status(issue_number: int):
+    task = tasks.get(issue_number)
+
+    if not task:
+        return {
+            "status": "not_found",
+            "issue_number": issue_number,
+        }
+
+    session_id = task.get("session_id")
+
+    if session_id:
+        try:
+            session = get_devin_session(session_id)
+
+            task["status"] = session.get("status")
+            task["pull_requests"] = session.get("pull_requests", [])
+            task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        except requests.RequestException as error:
+            task["status_check_error"] = str(error)
+
+    return task
