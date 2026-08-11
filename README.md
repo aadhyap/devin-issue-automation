@@ -1,8 +1,5 @@
 # devin-issue-automation
 Event-driven Automation that delegates engineering issues to Devin.
-# Devin Issue Automation
-
-Event-driven automation that delegates GitHub issues to Devin when they are labeled `devin-ready`.
 
 ## What it does
 
