@@ -1,9 +1,11 @@
+import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
-from fastapi import FastAPI, Request
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
 
 load_dotenv()
 
@@ -14,7 +16,28 @@ DEVIN_ORG_ID = os.environ["DEVIN_ORG_ID"]
 
 DEVIN_BASE_URL = "https://api.devin.ai/v3"
 
-tasks = {}
+TASKS_FILE = Path("tasks.json")
+
+
+def load_tasks():
+    if not TASKS_FILE.exists():
+        return {}
+
+    with open(TASKS_FILE, "r") as file:
+        data = json.load(file)
+
+    return {
+        int(issue_number): task
+        for issue_number, task in data.items()
+    }
+
+
+def save_tasks():
+    with open(TASKS_FILE, "w") as file:
+        json.dump(tasks, file, indent=2)
+
+
+tasks = load_tasks()
 
 
 def create_devin_session(issue: dict, repository: dict):
@@ -42,6 +65,7 @@ Description:
 {issue_body}
 
 Please:
+
 1. Investigate the issue and relevant code.
 2. Implement the fix described in the issue.
 3. Add or update tests as needed.
@@ -58,7 +82,9 @@ Do not make unrelated changes.
             "Authorization": f"Bearer {DEVIN_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={"prompt": prompt},
+        json={
+            "prompt": prompt
+        },
         timeout=30,
     )
 
@@ -87,9 +113,11 @@ async def github_webhook(request: Request):
 
     action = payload.get("action")
     label = payload.get("label", {}).get("name")
+
     issue = payload.get("issue", {})
     repository = payload.get("repository", {})
 
+    # Ignore anything that is not the devin-ready label being added.
     if action != "labeled" or label != "devin-ready":
         return {
             "status": "ignored",
@@ -98,6 +126,14 @@ async def github_webhook(request: Request):
         }
 
     issue_number = issue.get("number")
+
+    # Prevent accidentally creating multiple Devin sessions
+    # for the same issue.
+    if issue_number in tasks:
+        return {
+            "status": "already_exists",
+            "task": tasks[issue_number],
+        }
 
     try:
         session = create_devin_session(issue, repository)
@@ -109,10 +145,14 @@ async def github_webhook(request: Request):
             "repo": repository.get("full_name"),
             "session_id": session.get("session_id"),
             "session_url": session.get("url"),
-            "status": session.get("status"),
+            "devin_status": session.get("status"),
+            "outcome": "in_progress",
             "pull_requests": session.get("pull_requests", []),
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        save_tasks()
 
         print(f"Started Devin for issue #{issue_number}")
         print(f"Session: {session.get('url')}")
@@ -126,10 +166,17 @@ async def github_webhook(request: Request):
         tasks[issue_number] = {
             "issue_number": issue_number,
             "issue_title": issue.get("title"),
-            "status": "failed_to_start",
+            "issue_url": issue.get("html_url"),
+            "repo": repository.get("full_name"),
+            "devin_status": "failed_to_start",
+            "outcome": "failed",
+            "pull_requests": [],
             "error": str(error),
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        save_tasks()
 
         return {
             "status": "error",
@@ -139,9 +186,48 @@ async def github_webhook(request: Request):
 
 @app.get("/status")
 def status():
+    task_list = list(tasks.values())
+
+    successful_tasks = sum(
+        1
+        for task in task_list
+        if task.get("pull_requests")
+    )
+
+    failed_tasks = sum(
+        1
+        for task in task_list
+        if task.get("outcome") == "failed"
+    )
+
+    active_tasks = sum(
+        1
+        for task in task_list
+        if not task.get("pull_requests")
+        and task.get("outcome") != "failed"
+    )
+
+    prs_created = sum(
+        len(task.get("pull_requests", []))
+        for task in task_list
+    )
+
+    success_rate = (
+        round((successful_tasks / len(task_list)) * 100, 1)
+        if task_list
+        else 0
+    )
+
     return {
-        "total_tasks": len(tasks),
-        "tasks": list(tasks.values()),
+        "summary": {
+            "total_tasks": len(task_list),
+            "successful_tasks": successful_tasks,
+            "active_tasks": active_tasks,
+            "failed_tasks": failed_tasks,
+            "prs_created": prs_created,
+            "success_rate_percent": success_rate,
+        },
+        "tasks": task_list,
     }
 
 
@@ -157,15 +243,40 @@ def issue_status(issue_number: int):
 
     session_id = task.get("session_id")
 
-    if session_id:
-        try:
-            session = get_devin_session(session_id)
+    if not session_id:
+        return task
 
-            task["status"] = session.get("status")
-            task["pull_requests"] = session.get("pull_requests", [])
-            task["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        session = get_devin_session(session_id)
 
-        except requests.RequestException as error:
-            task["status_check_error"] = str(error)
+        task["devin_status"] = session.get("status")
+        task["pull_requests"] = session.get("pull_requests", [])
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        if task["pull_requests"]:
+            task["outcome"] = "pr_created"
+        elif task["devin_status"] in ["new", "running"]:
+            task["outcome"] = "in_progress"
+
+        save_tasks()
+
+    except requests.RequestException as error:
+        task["status_check_error"] = str(error)
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        save_tasks()
 
     return task
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Devin Issue Automation",
+        "status": "running",
+        "endpoints": {
+            "webhook": "/github-webhook",
+            "all_tasks": "/status",
+            "single_task": "/status/{issue_number}",
+        },
+    }
