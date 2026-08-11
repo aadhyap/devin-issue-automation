@@ -11,7 +11,7 @@ async def github_webhook(request: Request):
     issue = payload.get("issue", {})
 
     if action == "labeled" and label == "devin-ready":
-        print("Devin-ready issue received")
+        print("devin-ready issue received")
         print("Issue:", issue.get("number"))
         print("Title:", issue.get("title"))
         print("URL:", issue.get("html_url"))
