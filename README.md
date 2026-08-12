@@ -13,12 +13,20 @@ Event-driven Automation that delegates engineering issues to Devin.
 ## Architecture
 
 GitHub Issue
-→ `devin-ready`
-→ GitHub Webhook
-→ FastAPI service
-→ Devin API
-→ Devin session
-→ Pull Request
+      ↓
+Add `devin-ready` label
+      ↓
+GitHub Webhook
+      ↓
+FastAPI Automation Service
+      ↓
+Devin API
+      ↓
+Devin investigates + modifies code + runs tests
+      ↓
+Pull Request
+      ↓
+Status / Observability API
 
 ## Example
 
