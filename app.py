@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from datetime import datetime, timezone
@@ -138,13 +139,24 @@ Description:
 Please:
 
 1. Investigate the issue and relevant code.
-2. Implement the fix described in the issue.
-3. Add or update tests as needed.
-4. Run the relevant tests.
-5. Create a pull request with your changes.
-6. In the pull request, briefly explain what changed and how you verified it.
+2. Before making changes, ensure your working branch is based on the latest
+   upstream default branch. Fetch the latest upstream changes and safely
+   rebase or otherwise synchronize the working branch as appropriate.
+3. Implement the fix described in the issue.
+4. Add or update tests as needed.
+5. Run the relevant tests.
+6. Before creating the pull request, verify the branch is still up to date
+   with the upstream default branch. If upstream changed during the session,
+   safely synchronize again and resolve any conflicts without discarding
+   unrelated upstream changes.
+7. Create a pull request with your changes.
+8. In the pull request, briefly explain:
+   - what changed
+   - how the change was verified
+   - what tests were run
 
 Do not make unrelated changes.
+Do not force-push or rewrite shared upstream history.
 """
 
     response = requests.post(
@@ -280,9 +292,90 @@ async def github_webhook(request: Request):
         }
 
 
+
+# ---------------------------------------------------------------------------
+# Background status refresh
+# ---------------------------------------------------------------------------
+
+def refresh_task(issue_number: int, task: dict) -> None:
+    """Refresh one tracked task from Devin and persist the latest state."""
+    session_id = task.get("session_id")
+
+    if not session_id:
+        return
+
+    try:
+        session = get_devin_session(session_id)
+
+        current_prs = session.get("pull_requests", [])
+
+        task["devin_status"] = session.get("status")
+        task["pull_requests"] = current_prs
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        # First PR is our observable prototype completion event.
+        if current_prs:
+            task["outcome"] = "pr_created"
+
+            # Record completion only once so time-to-PR remains stable.
+            if not task.get("completed_at"):
+                task["completed_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+
+        elif task["devin_status"] in ["new", "running"]:
+            task["outcome"] = "in_progress"
+
+        save_tasks()
+
+    except requests.RequestException as error:
+        task["status_check_error"] = str(error)
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_tasks()
+
+
+async def poll_active_devin_sessions() -> None:
+    """Refresh active Devin sessions every 30 seconds."""
+    while True:
+        active_tasks = [
+            (issue_number, task)
+            for issue_number, task in tasks.items()
+            if task.get("outcome") == "in_progress"
+        ]
+
+        for issue_number, task in active_tasks:
+            refresh_task(issue_number, task)
+
+        await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def start_status_poller():
+    """Start the lightweight background status poller."""
+    asyncio.create_task(poll_active_devin_sessions())
+
+
 # ---------------------------------------------------------------------------
 # Observability
 # ---------------------------------------------------------------------------
+
+@app.get("/active")
+def active_tasks():
+    """Return all remediation tasks that are currently in progress."""
+    active = [
+        task
+        for task in tasks.values()
+        if task.get("outcome") == "in_progress"
+    ]
+
+    return {
+        "active_count": len(active),
+        "active_tasks": [
+            enrich_task_metrics(task)
+            for task in active
+        ],
+    }
+
 
 @app.get("/status")
 def status():
@@ -397,41 +490,7 @@ def issue_status(issue_number: int):
             "issue_number": issue_number,
         }
 
-    session_id = task.get("session_id")
-
-    if not session_id:
-        return enrich_task_metrics(task)
-
-    try:
-        session = get_devin_session(session_id)
-
-        previous_prs = task.get("pull_requests", [])
-        current_prs = session.get("pull_requests", [])
-
-        task["devin_status"] = session.get("status")
-        task["pull_requests"] = current_prs
-        task["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        # First PR is our observable prototype completion event.
-        if current_prs:
-            task["outcome"] = "pr_created"
-
-            # Record completion only once so time-to-PR remains stable.
-            if not task.get("completed_at"):
-                task["completed_at"] = (
-                    datetime.now(timezone.utc).isoformat()
-                )
-
-        elif task["devin_status"] in ["new", "running"]:
-            task["outcome"] = "in_progress"
-
-        save_tasks()
-
-    except requests.RequestException as error:
-        task["status_check_error"] = str(error)
-        task["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        save_tasks()
+    refresh_task(issue_number, task)
 
     return enrich_task_metrics(task)
 
@@ -452,6 +511,7 @@ def root():
         "endpoints": {
             "webhook": "POST /github-webhook",
             "all_tasks": "GET /status",
+            "active_tasks": "GET /active",
             "single_task": "GET /status/{issue_number}",
         },
     }
